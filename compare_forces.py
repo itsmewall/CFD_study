@@ -21,7 +21,7 @@ def main():
     y_min, y_max = -1.5 * c, 1.5 * c
 
     # Caixa do control volume (em torno do aerofólio)
-    cv_box = (-0.25, 1.25, -0.50, 0.50)
+    cv_box = (-0.75, 2.0, -0.9, 0.9)
 
     # ângulos para comparar
     alphas = [0.0, 4.0, 10.0]

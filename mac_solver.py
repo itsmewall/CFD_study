@@ -3,7 +3,9 @@
 # - Semi-Lagrangian RK2 advection (stable)
 # - Explicit diffusion
 # - Brinkman penalization (immersed body via chi)
-# - Pressure projection via PCG Poisson
+# - Pressure projection via:
+#     * Multigrid V-cycle (FAST, default)
+#     * PCG Poisson (fallback)
 # - Warm start (init_state)
 # - Early stop (convergence of Cl and div_rms)
 # - Force models:
@@ -49,8 +51,10 @@ def sample_u(u, x, y, x_min, y_min, dx, dy, nx, ny):
 
     i1 = i0 + 1
     j1 = j0 + 1
-    if i1 > nx + 2: i1 = nx + 2
-    if j1 > ny + 1: j1 = ny + 1
+    if i1 > nx + 2:
+        i1 = nx + 2
+    if j1 > ny + 1:
+        j1 = ny + 1
 
     v00 = u[i0, j0]
     v10 = u[i1, j0]
@@ -77,8 +81,10 @@ def sample_v(v, x, y, x_min, y_min, dx, dy, nx, ny):
 
     i1 = i0 + 1
     j1 = j0 + 1
-    if i1 > nx + 1: i1 = nx + 1
-    if j1 > ny + 2: j1 = ny + 2
+    if i1 > nx + 1:
+        i1 = nx + 1
+    if j1 > ny + 2:
+        j1 = ny + 2
 
     v00 = v[i0, j0]
     v10 = v[i1, j0]
@@ -108,15 +114,21 @@ def sample_p(p, x, y, x_min, y_min, dx, dy, nx, ny):
     tx = fx - i0
     ty = fy - j0
 
-    if i0 < 0: i0 = 0
-    if i0 > nx: i0 = nx
-    if j0 < 0: j0 = 0
-    if j0 > ny: j0 = ny
+    if i0 < 0:
+        i0 = 0
+    if i0 > nx:
+        i0 = nx
+    if j0 < 0:
+        j0 = 0
+    if j0 > ny:
+        j0 = ny
 
     i1 = i0 + 1
     j1 = j0 + 1
-    if i1 > nx + 1: i1 = nx + 1
-    if j1 > ny + 1: j1 = ny + 1
+    if i1 > nx + 1:
+        i1 = nx + 1
+    if j1 > ny + 1:
+        j1 = ny + 1
 
     v00 = p[i0, j0]
     v10 = p[i1, j0]
@@ -287,7 +299,7 @@ def project(u, v, p, dt, rho, dx, dy, nx, ny):
 
 
 # ============================================================
-# Poisson PCG
+# Poisson PCG (fallback)
 # ============================================================
 
 @njit(parallel=True)
@@ -323,7 +335,7 @@ def zero_mean_rhs_inplace(b, nx, ny):
 
 
 @njit
-def pcg_poisson_inplace(p, b, r, z, d, Ap, dx, dy, nx, ny, max_iter=350, tol=5e-7):
+def pcg_poisson_inplace(p, b, r, z, d, Ap, dx, dy, nx, ny, max_iter=800, tol=1e-6):
     apply_bc_pressure_neumann(p, nx, ny)
 
     apply_A(p, Ap, dx, dy, nx, ny)
@@ -376,6 +388,179 @@ def pcg_poisson_inplace(p, b, r, z, d, Ap, dx, dy, nx, ny, max_iter=350, tol=5e-
 
     apply_bc_pressure_neumann(p, nx, ny)
     return max_iter
+
+
+# ============================================================
+# Multigrid Poisson (FAST default)
+# ============================================================
+
+@njit(parallel=True)
+def mg_relax_rb_gs(p, b, dx, dy, nx, ny, omega=1.0, iters=2):
+    idx2 = 1.0 / (dx * dx)
+    idy2 = 1.0 / (dy * dy)
+    diag = -2.0 * (idx2 + idy2)
+
+    for _ in range(iters):
+        for color in range(2):
+            for j in prange(1, ny + 1):
+                for i in range(1, nx + 1):
+                    if ((i + j) & 1) != color:
+                        continue
+                    off = (p[i + 1, j] + p[i - 1, j]) * idx2 + (p[i, j + 1] + p[i, j - 1]) * idy2
+                    p_new = (b[i, j] - off) / diag
+                    p[i, j] = (1.0 - omega) * p[i, j] + omega * p_new
+
+        apply_bc_pressure_neumann(p, nx, ny)
+        p[1, 1] = 0.0
+
+
+@njit(parallel=True)
+def mg_residual(p, b, r, dx, dy, nx, ny):
+    idx2 = 1.0 / (dx * dx)
+    idy2 = 1.0 / (dy * dy)
+    for j in prange(1, ny + 1):
+        for i in range(1, nx + 1):
+            Ap = (p[i + 1, j] - 2.0 * p[i, j] + p[i - 1, j]) * idx2 + \
+                 (p[i, j + 1] - 2.0 * p[i, j] + p[i, j - 1]) * idy2
+            r[i, j] = b[i, j] - Ap
+
+
+@njit(parallel=True)
+def mg_restrict_fullweight(r_f, b_c, nxf, nyf):
+    nxc = nxf // 2
+    nyc = nyf // 2
+    for jc in prange(1, nyc + 1):
+        jf = 2 * jc
+        for ic in range(1, nxc + 1):
+            if_ = 2 * ic
+            b_c[ic, jc] = (
+                4.0 * r_f[if_, jf] +
+                2.0 * (r_f[if_ - 1, jf] + r_f[if_ + 1, jf] + r_f[if_, jf - 1] + r_f[if_, jf + 1]) +
+                (r_f[if_ - 1, jf - 1] + r_f[if_ - 1, jf + 1] + r_f[if_ + 1, jf - 1] + r_f[if_ + 1, jf + 1])
+            ) / 16.0
+
+
+@njit(parallel=True)
+def mg_prolong_bilinear(p_c, e_f, nxf, nyf):
+    nxc = nxf // 2
+    nyc = nyf // 2
+
+    for j in prange(0, nyf + 2):
+        for i in range(0, nxf + 2):
+            e_f[i, j] = 0.0
+
+    for jc in prange(1, nyc + 1):
+        for ic in range(1, nxc + 1):
+            ef_i = 2 * ic
+            ef_j = 2 * jc
+
+            v00 = p_c[ic, jc]
+            v10 = p_c[ic + 1, jc] if ic < nxc else v00
+            v01 = p_c[ic, jc + 1] if jc < nyc else v00
+            v11 = p_c[ic + 1, jc + 1] if (ic < nxc and jc < nyc) else v00
+
+            e_f[ef_i, ef_j] += v00
+            if ef_i + 1 <= nxf:
+                e_f[ef_i + 1, ef_j] += 0.5 * (v00 + v10)
+            if ef_j + 1 <= nyf:
+                e_f[ef_i, ef_j + 1] += 0.5 * (v00 + v01)
+            if (ef_i + 1 <= nxf) and (ef_j + 1 <= nyf):
+                e_f[ef_i + 1, ef_j + 1] += 0.25 * (v00 + v10 + v01 + v11)
+
+
+def _build_mg_context(nx, ny, dx, dy, dtype=np.float32, min_size=32):
+    # Finest level placeholders will be overwritten with actual p,b refs.
+    Ps = [None]
+    Bs = [None]
+    Rs = []
+    Es = []
+    dxs = [float(dx)]
+    dys = [float(dy)]
+    nxs = [int(nx)]
+    nys = [int(ny)]
+
+    while (nxs[-1] > min_size and nys[-1] > min_size and
+           (nxs[-1] % 2 == 0) and (nys[-1] % 2 == 0)):
+        nxc = nxs[-1] // 2
+        nyc = nys[-1] // 2
+        Ps.append(np.zeros((nxc + 2, nyc + 2), dtype=dtype))
+        Bs.append(np.zeros((nxc + 2, nyc + 2), dtype=dtype))
+        dxs.append(dxs[-1] * 2.0)
+        dys.append(dys[-1] * 2.0)
+        nxs.append(nxc)
+        nys.append(nyc)
+
+    # residual/correction buffers
+    for lev in range(len(Ps)):
+        # allocate based on each level size
+        if lev == 0:
+            # placeholders (will be replaced by finest size after binding)
+            Rs.append(None)
+            Es.append(None)
+        else:
+            Rs.append(np.zeros_like(Ps[lev]))
+            Es.append(np.zeros_like(Ps[lev]))
+
+    return {"Ps": Ps, "Bs": Bs, "Rs": Rs, "Es": Es, "dxs": dxs, "dys": dys, "nxs": nxs, "nys": nys}
+
+
+def mg_poisson_inplace(p_f, b_f, mgctx, vcycles=10, pre=2, post=2, omega=1.0, coarse_relax=60):
+    """
+    In-place V-cycle multigrid for Laplace(p)=b with Neumann BC.
+    mgctx is cached per (nx,ny,dx,dy).
+    Returns number of vcycles executed.
+    """
+    Ps = mgctx["Ps"]
+    Bs = mgctx["Bs"]
+    Rs = mgctx["Rs"]
+    Es = mgctx["Es"]
+    dxs = mgctx["dxs"]
+    dys = mgctx["dys"]
+    nxs = mgctx["nxs"]
+    nys = mgctx["nys"]
+
+    # bind finest arrays
+    Ps[0] = p_f
+    Bs[0] = b_f
+    if Rs[0] is None or Rs[0].shape != p_f.shape:
+        Rs[0] = np.zeros_like(p_f)
+    if Es[0] is None or Es[0].shape != p_f.shape:
+        Es[0] = np.zeros_like(p_f)
+
+    levels = len(Ps)
+
+    for _ in range(int(vcycles)):
+        # down
+        for lev in range(levels - 1):
+            mg_relax_rb_gs(Ps[lev], Bs[lev], dxs[lev], dys[lev], nxs[lev], nys[lev], omega=omega, iters=pre)
+
+            mg_residual(Ps[lev], Bs[lev], Rs[lev], dxs[lev], dys[lev], nxs[lev], nys[lev])
+            apply_bc_pressure_neumann(Rs[lev], nxs[lev], nys[lev])
+
+            Bs[lev + 1][:, :] = 0.0
+            mg_restrict_fullweight(Rs[lev], Bs[lev + 1], nxs[lev], nys[lev])
+            apply_bc_pressure_neumann(Bs[lev + 1], nxs[lev + 1], nys[lev + 1])
+            Bs[lev + 1][1, 1] = 0.0
+
+            Ps[lev + 1][:, :] = 0.0
+            apply_bc_pressure_neumann(Ps[lev + 1], nxs[lev + 1], nys[lev + 1])
+            Ps[lev + 1][1, 1] = 0.0
+
+        # coarse
+        last = levels - 1
+        mg_relax_rb_gs(Ps[last], Bs[last], dxs[last], dys[last], nxs[last], nys[last], omega=omega, iters=coarse_relax)
+
+        # up
+        for lev in range(levels - 2, -1, -1):
+            mg_prolong_bilinear(Ps[lev + 1], Es[lev], nxs[lev], nys[lev])
+
+            Ps[lev][1:nxs[lev] + 1, 1:nys[lev] + 1] += Es[lev][1:nxs[lev] + 1, 1:nys[lev] + 1]
+            apply_bc_pressure_neumann(Ps[lev], nxs[lev], nys[lev])
+            Ps[lev][1, 1] = 0.0
+
+            mg_relax_rb_gs(Ps[lev], Bs[lev], dxs[lev], dys[lev], nxs[lev], nys[lev], omega=omega, iters=post)
+
+    return int(vcycles)
 
 
 # ============================================================
@@ -433,7 +618,7 @@ def cv_surface_forces(u, v, p, rho, x_min, y_min, dx, dy, nx, ny, x1, x2, y1, y2
     Px = 0.0
     Py = 0.0
 
-    nseg_y = max(8, int(np.round((y2 - y1) / dy)) * 2)  # mais amostras (ruído menor)
+    nseg_y = max(8, int(np.round((y2 - y1) / dy)) * 2)
     nseg_x = max(8, int(np.round((x2 - x1) / dx)) * 2)
     ds_y = (y2 - y1) / nseg_y
     ds_x = (x2 - x1) / nseg_x
@@ -512,7 +697,6 @@ def compute_force_coeffs_control_volume(u, v, p, rho, dt_base, step_idx,
     if prev_mom is None:
         dmxdt = 0.0
         dmydt = 0.0
-        dt_eff = dt_base
     else:
         pmx, pmy, pstep = prev_mom
         nstep = max(1, int(step_idx) - int(pstep))
@@ -522,7 +706,6 @@ def compute_force_coeffs_control_volume(u, v, p, rho, dt_base, step_idx,
 
     Cx, Cy, Px, Py = cv_surface_forces(u, v, p, rho, x_min, y_min, dx, dy, nx, ny, x1, x2, y1, y2)
 
-    # Force on body (approx, no viscous term on CV)
     Fx = -dmxdt - Cx + Px
     Fy = -dmydt - Cy + Py
 
@@ -576,10 +759,14 @@ def advect_particles_rk2(xp, yp, u, v, dt, x_min, x_max, y_min, y_max, dx, dy, n
         xn = x + dt * u2
         yn = y + dt * v2
 
-        if xn < x_min: xn = x_min
-        if xn > x_max: xn = x_max
-        if yn < y_min: yn = y_min
-        if yn > y_max: yn = y_max
+        if xn < x_min:
+            xn = x_min
+        if xn > x_max:
+            xn = x_max
+        if yn < y_min:
+            yn = y_min
+        if yn > y_max:
+            yn = y_max
 
         xp[k] = xn
         yp[k] = yn
@@ -609,6 +796,21 @@ def simulate_airfoil_naca4412(
     force_method="cv",     # "brinkman" | "cv" | "both"
     cv_box=(-0.25, 1.25, -0.50, 0.50),
 
+    # Pressure solver selection
+    pressure_solver="mg",  # "mg" (fast) | "pcg" (fallback)
+
+    # MG params
+    mg_vcycles=10,
+    mg_pre=2,
+    mg_post=2,
+    mg_omega=1.0,
+    mg_coarse_relax=60,
+    mg_min_size=32,
+
+    # PCG params
+    pcg_max_iter=800,
+    pcg_tol=1e-6,
+
     record_every=0,
     record_max=0,
     with_particles=False,
@@ -633,6 +835,7 @@ def simulate_airfoil_naca4412(
     div = np.zeros_like(p)
     b = np.zeros_like(p)
 
+    # PCG buffers (still allocated; cheap vs runtime)
     r = np.zeros_like(p)
     z = np.zeros_like(p)
     dvec = np.zeros_like(p)
@@ -670,6 +873,11 @@ def simulate_airfoil_naca4412(
 
     apply_bc_airfoil(u, v, p, nx, ny, Ux, Uy)
 
+    # MG context (cached once)
+    mgctx = None
+    if str(pressure_solver).lower() == "mg":
+        mgctx = _build_mg_context(nx, ny, dx, dy, dtype=np.float32, min_size=int(mg_min_size))
+
     # recording
     frames_w = []
     particles_frames = None
@@ -693,12 +901,13 @@ def simulate_airfoil_naca4412(
     last_check_step = 0
     stopped_early = False
 
-    # CV memory (FIXED)
     prev_mom_cv = None
 
     Cl = Cd = 0.0
     Cl_b = Cd_b = 0.0
     Cl_cv = Cd_cv = 0.0
+
+    solver_tag = "mg" if str(pressure_solver).lower() == "mg" else "pcg"
 
     for n in range(1, steps + 1):
         advect_semi_lagrangian(u, v, u_adv, v_adv, dt, x_min, x_max, y_min, y_max, dx, dy, nx, ny)
@@ -710,7 +919,18 @@ def simulate_airfoil_naca4412(
         b[1:nx + 1, 1:ny + 1] = (rho / dt) * div[1:nx + 1, 1:ny + 1]
         zero_mean_rhs_inplace(b, nx, ny)
 
-        iters = pcg_poisson_inplace(p, b, r, z, dvec, Ap, dx, dy, nx, ny, max_iter=350, tol=5e-7)
+        if solver_tag == "mg":
+            iters = mg_poisson_inplace(
+                p, b, mgctx,
+                vcycles=int(mg_vcycles),
+                pre=int(mg_pre),
+                post=int(mg_post),
+                omega=float(mg_omega),
+                coarse_relax=int(mg_coarse_relax),
+            )
+        else:
+            iters = pcg_poisson_inplace(p, b, r, z, dvec, Ap, dx, dy, nx, ny, max_iter=int(pcg_max_iter), tol=float(pcg_tol))
+
         apply_bc_airfoil(u_star, v_star, p, nx, ny, Ux, Uy)
 
         project(u_star, v_star, p, dt, rho, dx, dy, nx, ny)
@@ -746,14 +966,14 @@ def simulate_airfoil_naca4412(
 
             if force_method == "brinkman":
                 Cl, Cd = Cl_b, Cd_b
-                print(f"[airfoil] step {n}/{steps} | pcg {iters} | div_rms {dnorm:.3e} | Cl~{Cl:.3f} Cd~{Cd:.3f}")
+                print(f"[airfoil] step {n}/{steps} | {solver_tag} {iters} | div_rms {dnorm:.3e} | Cl~{Cl:.3f} Cd~{Cd:.3f}")
             elif force_method == "cv":
                 Cl, Cd = Cl_cv, Cd_cv
-                print(f"[airfoil] step {n}/{steps} | pcg {iters} | div_rms {dnorm:.3e} | Cl~{Cl:.3f} Cd~{Cd:.3f}")
+                print(f"[airfoil] step {n}/{steps} | {solver_tag} {iters} | div_rms {dnorm:.3e} | Cl~{Cl:.3f} Cd~{Cd:.3f}")
             else:
                 Cl, Cd = Cl_cv, Cd_cv
                 print(
-                    f"[airfoil] step {n}/{steps} | pcg {iters} | div_rms {dnorm:.3e} | "
+                    f"[airfoil] step {n}/{steps} | {solver_tag} {iters} | div_rms {dnorm:.3e} | "
                     f"Brinkman Cl~{Cl_b:.3f} Cd~{Cd_b:.3f} | "
                     f"CV Cl~{Cl_cv:.3f} Cd~{Cd_cv:.3f}"
                 )
@@ -818,8 +1038,10 @@ def simulate_airfoil_naca4412(
 
         "dx": float(dx),
         "dy": float(dy),
-        "x_min": float(x_min), "x_max": float(x_max),
-        "y_min": float(y_min), "y_max": float(y_max),
+        "x_min": float(x_min),
+        "x_max": float(x_max),
+        "y_min": float(y_min),
+        "y_max": float(y_max),
 
         "state": {"u": u.copy(), "v": v.copy(), "p": p.copy()},
 
@@ -829,4 +1051,5 @@ def simulate_airfoil_naca4412(
         "frames_w": frames_w,
         "particles": particles_frames,
         "record_every": int(record_every) if record_every else 0,
+        "pressure_solver": solver_tag,
     }
