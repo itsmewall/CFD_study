@@ -33,9 +33,15 @@ def main():
 
     # Posiciona no domínio: LE em x=0, corda 0..1; centraliza em y=0
     # (pivô em (0,0) -> rotaciona em torno do LE; ok para v1)
-    Xr, Yr = rotate_translate(X, Y, np.deg2rad(alpha_deg), x0=0.0, y0=0.0)
+    Xr, Yr = rotate_translate(X, Y, 0.0, x0=0.0, y0=0.0)
 
-    chi_cell, dx, dy = build_chi_cell(nx, ny, x_min, x_max, y_min, y_max, Xr, Yr)
+    chi_cell, dx, dy = build_chi_cell(
+        nx, ny, x_min, x_max, y_min, y_max, Xr, Yr,
+        supersample=4,       # 4x4 por célula (bom custo-benefício)
+        sdf_smooth=True,     # suaviza contorno via SDF
+        eps_cells=2.0        # faixa ~2 células
+    )
+
 
     t0 = time.time()
     res = simulate_airfoil_naca4412(
