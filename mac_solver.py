@@ -132,7 +132,6 @@ def apply_bc_airfoil(u, v, p, nx, ny, Ux, Uy):
     for j in range(1, ny + 1):
         u[1, j] = Ux
         u[0, j] = 2.0 * Ux - u[1, j]
-
         u[nx + 1, j] = u[nx, j]
         u[nx + 2, j] = u[nx + 1, j]
 
@@ -140,7 +139,7 @@ def apply_bc_airfoil(u, v, p, nx, ny, Ux, Uy):
         u[i, 0] = 2.0 * Ux - u[i, 1]
         u[i, ny + 1] = 2.0 * Ux - u[i, ny]
 
-    # v inlet: força Uy na primeira coluna interna (aprox v1)
+    # v inlet: força Uy na primeira coluna interna
     for j in range(1, ny + 2):
         v[1, j] = Uy
         v[0, j] = 2.0 * Uy - v[1, j]
@@ -292,7 +291,7 @@ def zero_mean_rhs_inplace(b, nx, ny):
             b[i, j] -= mean_b
 
 @njit
-def pcg_poisson_inplace(p, b, r, z, d, Ap, dx, dy, nx, ny, max_iter=350, tol=1e-6):
+def pcg_poisson_inplace(p, b, r, z, d, Ap, dx, dy, nx, ny, max_iter=350, tol=5e-7):
     apply_bc_pressure_neumann(p, nx, ny)
 
     apply_A(p, Ap, dx, dy, nx, ny)
@@ -351,7 +350,6 @@ def pcg_poisson_inplace(p, b, r, z, d, Ap, dx, dy, nx, ny, max_iter=350, tol=1e-
 # ============================================================
 
 def compute_force_coeffs_brinkman(u, v, chi_u, chi_v, rho, eta, Uinf, alpha_rad, dx, dy, nx, ny):
-    # Força no corpo = +∫(rho * chi/eta * u) dV  (oposta à força no fluido)
     Fx =  rho * (dx * dy / eta) * float(np.sum(chi_u * u[1:nx + 2, 1:ny + 1]))
     Fy =  rho * (dx * dy / eta) * float(np.sum(chi_v * v[1:nx + 1, 1:ny + 2]))
 
@@ -404,7 +402,7 @@ def simulate_cavity(nx, ny, steps, dt, rho, nu, U_lid, out_every=200):
         b[1:nx + 1, 1:ny + 1] = (rho / dt) * div[1:nx + 1, 1:ny + 1]
         zero_mean_rhs_inplace(b, nx, ny)
 
-        iters = pcg_poisson_inplace(p, b, r, z, d, Ap, dx, dy, nx, ny, max_iter=300, tol=1e-6)
+        iters = pcg_poisson_inplace(p, b, r, z, d, Ap, dx, dy, nx, ny, max_iter=300, tol=5e-7)
         apply_bc_cavity(u_star, v_star, p, nx, ny, U_lid)
 
         project(u_star, v_star, p, dt, rho, dx, dy, nx, ny)
@@ -462,11 +460,9 @@ def simulate_airfoil_naca4412(
     Ux = Uinf * np.cos(alpha)
     Uy = Uinf * np.sin(alpha)
 
-    # --------------------------------------------------------
-    # chi_u / chi_v FRACIONÁRIOS (média de células adjacentes)
-    # --------------------------------------------------------
     chi_cell = np.asarray(chi_cell, dtype=np.float32)
 
+    # chi_u / chi_v FRACIONÁRIOS (média de células adjacentes)
     chi_u = np.zeros((nx + 1, ny), dtype=np.float32)
     for j in range(ny):
         for i in range(nx + 1):
@@ -501,7 +497,7 @@ def simulate_airfoil_naca4412(
         b[1:nx + 1, 1:ny + 1] = (rho / dt) * div[1:nx + 1, 1:ny + 1]
         zero_mean_rhs_inplace(b, nx, ny)
 
-        iters = pcg_poisson_inplace(p, b, r, z, d, Ap, dx, dy, nx, ny, max_iter=350, tol=1e-6)
+        iters = pcg_poisson_inplace(p, b, r, z, d, Ap, dx, dy, nx, ny, max_iter=350, tol=5e-7)
         apply_bc_airfoil(u_star, v_star, p, nx, ny, Ux, Uy)
 
         project(u_star, v_star, p, dt, rho, dx, dy, nx, ny)
