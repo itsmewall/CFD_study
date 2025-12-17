@@ -15,6 +15,7 @@ def clamp(x, a, b):
 
 # ============================================================
 # Amostragem bilinear em grids MAC
+# u: faces verticais; v: faces horizontais
 # ============================================================
 
 @njit(inline="always")
@@ -350,8 +351,8 @@ def pcg_poisson_inplace(p, b, r, z, d, Ap, dx, dy, nx, ny, max_iter=350, tol=5e-
 # ============================================================
 
 def compute_force_coeffs_brinkman(u, v, chi_u, chi_v, rho, eta, Uinf, alpha_rad, dx, dy, nx, ny):
-    Fx =  rho * (dx * dy / eta) * float(np.sum(chi_u * u[1:nx + 2, 1:ny + 1]))
-    Fy =  rho * (dx * dy / eta) * float(np.sum(chi_v * v[1:nx + 1, 1:ny + 2]))
+    Fx = rho * (dx * dy / eta) * float(np.sum(chi_u * u[1:nx + 2, 1:ny + 1]))
+    Fy = rho * (dx * dy / eta) * float(np.sum(chi_v * v[1:nx + 1, 1:ny + 2]))
 
     ca = np.cos(alpha_rad); sa = np.sin(alpha_rad)
     D = Fx * ca + Fy * sa
@@ -364,7 +365,49 @@ def compute_force_coeffs_brinkman(u, v, chi_u, chi_v, rho, eta, Uinf, alpha_rad,
     return Cl, Cd
 
 # ============================================================
-# Public: cavity
+# Helpers p/ vorticidade e partículas (numba)
+# ============================================================
+
+@njit(parallel=True)
+def make_cell_centered(u, v, uc, vc, nx, ny):
+    for j in prange(1, ny + 1):
+        for i in range(1, nx + 1):
+            uc[i - 1, j - 1] = 0.5 * (u[i, j] + u[i + 1, j])
+            vc[i - 1, j - 1] = 0.5 * (v[i, j] + v[i, j + 1])
+
+@njit(parallel=True)
+def compute_vorticity(uc, vc, w, dx, dy, nx, ny):
+    inv2dx = 1.0 / (2.0 * dx)
+    inv2dy = 1.0 / (2.0 * dy)
+    for j in prange(1, ny - 1):
+        for i in range(1, nx - 1):
+            dvdx = (vc[i + 1, j] - vc[i - 1, j]) * inv2dx
+            dudy = (uc[i, j + 1] - uc[i, j - 1]) * inv2dy
+            w[i, j] = dvdx - dudy
+
+@njit(parallel=True)
+def advect_particles_rk2(xp, yp, u, v, dt, x_min, x_max, y_min, y_max, dx, dy, nx, ny):
+    for k in prange(xp.shape[0]):
+        x = xp[k]; y = yp[k]
+
+        u1, v1 = vel_at(u, v, x, y, x_min, y_min, dx, dy, nx, ny)
+        xm = x + 0.5 * dt * u1
+        ym = y + 0.5 * dt * v1
+        u2, v2 = vel_at(u, v, xm, ym, x_min, y_min, dx, dy, nx, ny)
+
+        xn = x + dt * u2
+        yn = y + dt * v2
+
+        if xn < x_min: xn = x_min
+        if xn > x_max: xn = x_max
+        if yn < y_min: yn = y_min
+        if yn > y_max: yn = y_max
+
+        xp[k] = xn
+        yp[k] = yn
+
+# ============================================================
+# Public: cavity (mantido)
 # ============================================================
 
 def simulate_cavity(nx, ny, steps, dt, rho, nu, U_lid, out_every=200):
@@ -417,15 +460,12 @@ def simulate_cavity(nx, ny, steps, dt, rho, nu, U_lid, out_every=200):
 
     uc = np.zeros((nx, ny), dtype=np.float32)
     vc = np.zeros((nx, ny), dtype=np.float32)
-    for j in range(1, ny + 1):
-        for i in range(1, nx + 1):
-            uc[i - 1, j - 1] = 0.5 * (u[i, j] + u[i + 1, j])
-            vc[i - 1, j - 1] = 0.5 * (v[i, j] + v[i, j + 1])
+    make_cell_centered(u, v, uc, vc, nx, ny)
 
     return {"p": p[1:nx + 1, 1:ny + 1].copy(), "uc": uc, "vc": vc}
 
 # ============================================================
-# Public: airfoil
+# Public: airfoil (com gravação de vorticidade + partículas)
 # ============================================================
 
 def simulate_airfoil_naca4412(
@@ -434,7 +474,15 @@ def simulate_airfoil_naca4412(
     Uinf, alpha_deg,
     x_min, x_max, y_min, y_max,
     chi_cell, eta=1e-3,
-    out_every=200
+    out_every=200,
+    record_every=25,          # grava a cada N passos
+    record_max=240,           # limite de frames (RAM)
+    with_particles=True,
+    n_particles=4000,
+    seed_x=-1.5,
+    seed_ymin=-0.4,
+    seed_ymax=0.4,
+    particles_seed=1234
 ):
     dx = (x_max - x_min) / nx
     dy = (y_max - y_min) / ny
@@ -482,6 +530,24 @@ def simulate_airfoil_naca4412(
     v[1:nx + 1, 1:ny + 2] = Uy
     apply_bc_airfoil(u, v, p, nx, ny, Ux, Uy)
 
+    # buffers para gravação
+    uc_buf = np.zeros((nx, ny), dtype=np.float32)
+    vc_buf = np.zeros((nx, ny), dtype=np.float32)
+    w_buf  = np.zeros((nx, ny), dtype=np.float32)
+
+    frames_w = []
+    particles_frames = None
+
+    # partículas
+    if with_particles and n_particles > 0:
+        rng = np.random.default_rng(particles_seed)
+        xp = np.full((n_particles,), seed_x, dtype=np.float32)
+        yp = rng.uniform(seed_ymin, seed_ymax, size=(n_particles,)).astype(np.float32)
+        particles_frames = []
+    else:
+        xp = None
+        yp = None
+
     Cl = 0.0
     Cd = 0.0
 
@@ -506,18 +572,32 @@ def simulate_airfoil_naca4412(
         u, u_star = u_star, u
         v, v_star = v_star, v
 
+        # partículas (deslocamento do fluido)
+        if xp is not None:
+            advect_particles_rk2(xp, yp, u, v, dt, x_min, x_max, y_min, y_max, dx, dy, nx, ny)
+
+        # grava frames
+        if record_every and (n % record_every == 0) and (len(frames_w) < record_max):
+            make_cell_centered(u, v, uc_buf, vc_buf, nx, ny)
+            w_buf[:, :] = 0.0
+            compute_vorticity(uc_buf, vc_buf, w_buf, dx, dy, nx, ny)
+            frames_w.append(w_buf.astype(np.float16).copy())
+
+            if xp is not None:
+                P = np.empty((n_particles, 2), dtype=np.float32)
+                P[:, 0] = xp
+                P[:, 1] = yp
+                particles_frames.append(P)
+
         if out_every and (n % out_every == 0):
             dnorm = float(np.sqrt(np.mean(div[1:nx + 1, 1:ny + 1] ** 2)))
             Cl, Cd = compute_force_coeffs_brinkman(u, v, chi_u, chi_v, rho, eta, Uinf, alpha, dx, dy, nx, ny)
             print(f"[airfoil] step {n}/{steps} | pcg {iters} | div_rms {dnorm:.3e} | Cl~{Cl:.3f} Cd~{Cd:.3f}")
 
-    # cell-centered para plot
+    # cell-centered final
     uc = np.zeros((nx, ny), dtype=np.float32)
     vc = np.zeros((nx, ny), dtype=np.float32)
-    for j in range(1, ny + 1):
-        for i in range(1, nx + 1):
-            uc[i - 1, j - 1] = 0.5 * (u[i, j] + u[i + 1, j])
-            vc[i - 1, j - 1] = 0.5 * (v[i, j] + v[i, j + 1])
+    make_cell_centered(u, v, uc, vc, nx, ny)
 
     Cl, Cd = compute_force_coeffs_brinkman(u, v, chi_u, chi_v, rho, eta, Uinf, alpha, dx, dy, nx, ny)
 
@@ -529,4 +609,9 @@ def simulate_airfoil_naca4412(
         "Cd": Cd,
         "dx": dx,
         "dy": dy,
+        "frames_w": frames_w,
+        "particles": particles_frames,
+        "x_min": x_min, "x_max": x_max,
+        "y_min": y_min, "y_max": y_max,
+        "record_every": record_every,
     }
