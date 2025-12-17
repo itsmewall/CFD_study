@@ -1,0 +1,33 @@
+## Checklist de melhorias (execução)
+
+### 1) Velocidade no sweep (ganho imediato)
+
+* [ ] Implementar **critério de parada automática** por convergência (Cl e div_rms estáveis).
+* [ ] Implementar **warm start** no sweep de alpha (caso ( \alpha_i ) inicia com campos do ( \alpha_{i-1} )).
+* [ ] No `sweep_alpha.py`, **desligar gravação temporal** (`record_every=0`, `with_particles=False`) e logs (`out_every=0`) por padrão.
+
+### 2) Forças mais confiáveis (sem encarecer)
+
+* [ ] Implementar cálculo de **Cl/Cd por controle de momento (control volume)**.
+* [ ] Comparar **Brinkman vs Control Volume** em 2–3 ângulos (ex.: 0°, 4°, 10°) e fixar o método padrão.
+
+### 3) Acelerar o Poisson (gargalo)
+
+* [ ] Adicionar **precondicionador simples** no PCG (SSOR/ILU0) e medir iterações.
+* [ ] Se ainda estiver alto, implementar **Multigrid (V-cycle)** ou **MG como precondicionador do CG (MGPCG)**.
+
+### 4) Qualidade de contorno (estabilidade/menos reflexo)
+
+* [ ] Implementar **convective outlet** (Orlanski) ou **sponge layer** na região de saída.
+* [ ] Validar: `div_rms` cai e Cl/Cd oscilam menos, sem aumentar muito o tempo.
+
+### 5) Produto e reprodutibilidade
+
+* [ ] Criar `cases/*.json` com parâmetros (Re, alpha, nx, ny, dt, steps).
+* [ ] Salvar sempre: `polar_CL_CD_vs_alpha.csv`, `*.npz` (campos finais), `log.txt`.
+* [ ] Criar comando único de execução: `run_case.py` e `sweep_case.py`.
+
+### 6) Validação mínima (para não se enganar)
+
+* [ ] Rodar **cavity** e um caso de **canal/Poiseuille** e checar se bate com referência simples.
+* [ ] Rodar o NACA 4412 em 0° e 4° e confirmar **sinal** e **tendência** do Cl.

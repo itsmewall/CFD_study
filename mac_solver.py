@@ -1,5 +1,21 @@
+# mac_solver.py
+# MAC (staggered grid) incompressible Navier–Stokes 2D
+# - Semi-Lagrangian RK2 advection (stable)
+# - Explicit diffusion
+# - Brinkman penalization (immersed body via chi)
+# - Pressure projection via PCG Poisson
+# - Warm start (init_state)
+# - Early stop (convergence of Cl and div_rms)
+# - Force models:
+#     * Brinkman
+#     * Control Volume (momentum balance on a rectangular CV)  [FIXED dt_eff]
+# - Optional time recording:
+#     * Vorticity frames
+#     * Passive tracers (particles)
+
 import numpy as np
 from numba import njit, prange
+
 
 # ============================================================
 # Utils
@@ -13,9 +29,9 @@ def clamp(x, a, b):
         return b
     return x
 
+
 # ============================================================
-# Amostragem bilinear em grids MAC
-# u: faces verticais; v: faces horizontais
+# Bilinear sampling on MAC grids
 # ============================================================
 
 @njit(inline="always")
@@ -45,6 +61,7 @@ def sample_u(u, x, y, x_min, y_min, dx, dy, nx, ny):
     b = v01 * (1.0 - tx) + v11 * tx
     return a * (1.0 - ty) + b * ty
 
+
 @njit(inline="always")
 def sample_v(v, x, y, x_min, y_min, dx, dy, nx, ny):
     fx = (x - x_min) / dx + 0.5
@@ -72,12 +89,44 @@ def sample_v(v, x, y, x_min, y_min, dx, dy, nx, ny):
     b = v01 * (1.0 - tx) + v11 * tx
     return a * (1.0 - ty) + b * ty
 
+
 @njit(inline="always")
 def vel_at(u, v, x, y, x_min, y_min, dx, dy, nx, ny):
     return (
         sample_u(u, x, y, x_min, y_min, dx, dy, nx, ny),
         sample_v(v, x, y, x_min, y_min, dx, dy, nx, ny),
     )
+
+
+@njit(inline="always")
+def sample_p(p, x, y, x_min, y_min, dx, dy, nx, ny):
+    fx = (x - x_min) / dx + 0.5
+    fy = (y - y_min) / dy + 0.5
+
+    i0 = int(np.floor(fx))
+    j0 = int(np.floor(fy))
+    tx = fx - i0
+    ty = fy - j0
+
+    if i0 < 0: i0 = 0
+    if i0 > nx: i0 = nx
+    if j0 < 0: j0 = 0
+    if j0 > ny: j0 = ny
+
+    i1 = i0 + 1
+    j1 = j0 + 1
+    if i1 > nx + 1: i1 = nx + 1
+    if j1 > ny + 1: j1 = ny + 1
+
+    v00 = p[i0, j0]
+    v10 = p[i1, j0]
+    v01 = p[i0, j1]
+    v11 = p[i1, j1]
+
+    a = v00 * (1.0 - tx) + v10 * tx
+    b = v01 * (1.0 - tx) + v11 * tx
+    return a * (1.0 - ty) + b * ty
+
 
 # ============================================================
 # Pressure BC (Neumann) + gauge fix
@@ -93,36 +142,9 @@ def apply_bc_pressure_neumann(p, nx, ny):
         p[i, ny + 1] = p[i, ny]
     p[1, 1] = 0.0
 
-# ============================================================
-# BCs - Cavity
-# ============================================================
-
-@njit
-def apply_bc_cavity(u, v, p, nx, ny, U_lid):
-    apply_bc_pressure_neumann(p, nx, ny)
-
-    for j in range(1, ny + 1):
-        u[1, j] = 0.0
-        u[nx + 1, j] = 0.0
-        u[0, j] = -u[1, j]
-        u[nx + 2, j] = -u[nx + 1, j]
-
-    for i in range(1, nx + 2):
-        u[i, 0] = -u[i, 1]
-        u[i, ny + 1] = 2.0 * U_lid - u[i, ny]
-
-    for i in range(1, nx + 1):
-        v[i, 1] = 0.0
-        v[i, ny + 1] = 0.0
-        v[i, 0] = -v[i, 1]
-        v[i, ny + 2] = -v[i, ny + 1]
-
-    for j in range(1, ny + 2):
-        v[0, j] = -v[1, j]
-        v[nx + 1, j] = -v[nx, j]
 
 # ============================================================
-# BCs - Airfoil
+# BCs - Airfoil domain
 # ============================================================
 
 @njit
@@ -140,18 +162,19 @@ def apply_bc_airfoil(u, v, p, nx, ny, Ux, Uy):
         u[i, 0] = 2.0 * Ux - u[i, 1]
         u[i, ny + 1] = 2.0 * Ux - u[i, ny]
 
-    # v inlet: força Uy na primeira coluna interna
+    # v inlet
     for j in range(1, ny + 2):
         v[1, j] = Uy
         v[0, j] = 2.0 * Uy - v[1, j]
         v[nx + 1, j] = v[nx, j]
 
-    # v topo/baixo: Uy
+    # v topo/baixo
     for i in range(1, nx + 1):
         v[i, 1] = Uy
         v[i, 0] = 2.0 * Uy - v[i, 1]
         v[i, ny + 1] = Uy
         v[i, ny + 2] = 2.0 * Uy - v[i, ny + 1]
+
 
 # ============================================================
 # Advection (semi-Lagrangian RK2)
@@ -193,6 +216,7 @@ def advect_semi_lagrangian(u0, v0, u1, v1, dt, x_min, x_max, y_min, y_max, dx, d
 
             v1[i, j] = sample_v(v0, xb, yb, x_min, y_min, dx, dy, nx, ny)
 
+
 # ============================================================
 # Diffusion (explicit Laplacian)
 # ============================================================
@@ -214,8 +238,9 @@ def diffuse_inplace(u_in, v_in, u_out, v_out, nu, dt, dx, dy, nx, ny):
                   (v_in[i, j + 1] - 2 * v_in[i, j] + v_in[i, j - 1]) * idy2
             v_out[i, j] = v_in[i, j] + nu * dt * lap
 
+
 # ============================================================
-# Brinkman penalization (chi fracionário)
+# Brinkman penalization
 # ============================================================
 
 @njit(parallel=True)
@@ -232,6 +257,7 @@ def brinkman_penalize(u, v, chi_u, chi_v, dt, eta, nx, ny):
             if chi > 1e-8:
                 v[i, j] = v[i, j] / (1.0 + dt * chi / eta)
 
+
 # ============================================================
 # Divergence + Projection
 # ============================================================
@@ -243,6 +269,7 @@ def compute_divergence(u, v, div, dx, dy, nx, ny):
     for j in prange(1, ny + 1):
         for i in range(1, nx + 1):
             div[i, j] = (u[i + 1, j] - u[i, j]) * invdx + (v[i, j + 1] - v[i, j]) * invdy
+
 
 @njit(parallel=True)
 def project(u, v, p, dt, rho, dx, dy, nx, ny):
@@ -258,6 +285,7 @@ def project(u, v, p, dt, rho, dx, dy, nx, ny):
         for i in range(1, nx + 1):
             v[i, j] -= scale * (p[i, j] - p[i, j - 1]) * invdy
 
+
 # ============================================================
 # Poisson PCG
 # ============================================================
@@ -271,6 +299,7 @@ def apply_A(p, Ap, dx, dy, nx, ny):
             Ap[i, j] = (p[i + 1, j] - 2 * p[i, j] + p[i - 1, j]) * idx2 + \
                        (p[i, j + 1] - 2 * p[i, j] + p[i, j - 1]) * idy2
 
+
 @njit
 def dot_inner(a, b, nx, ny):
     s = 0.0
@@ -278,6 +307,7 @@ def dot_inner(a, b, nx, ny):
         for i in range(1, nx + 1):
             s += a[i, j] * b[i, j]
     return s
+
 
 @njit
 def zero_mean_rhs_inplace(b, nx, ny):
@@ -290,6 +320,7 @@ def zero_mean_rhs_inplace(b, nx, ny):
     for j in range(1, ny + 1):
         for i in range(1, nx + 1):
             b[i, j] -= mean_b
+
 
 @njit
 def pcg_poisson_inplace(p, b, r, z, d, Ap, dx, dy, nx, ny, max_iter=350, tol=5e-7):
@@ -346,26 +377,170 @@ def pcg_poisson_inplace(p, b, r, z, d, Ap, dx, dy, nx, ny, max_iter=350, tol=5e-
     apply_bc_pressure_neumann(p, nx, ny)
     return max_iter
 
+
 # ============================================================
-# Força (Brinkman) — força no CORPO
+# Forces: Brinkman
 # ============================================================
 
 def compute_force_coeffs_brinkman(u, v, chi_u, chi_v, rho, eta, Uinf, alpha_rad, dx, dy, nx, ny):
     Fx = rho * (dx * dy / eta) * float(np.sum(chi_u * u[1:nx + 2, 1:ny + 1]))
     Fy = rho * (dx * dy / eta) * float(np.sum(chi_v * v[1:nx + 1, 1:ny + 2]))
 
-    ca = np.cos(alpha_rad); sa = np.sin(alpha_rad)
+    ca = np.cos(alpha_rad)
+    sa = np.sin(alpha_rad)
     D = Fx * ca + Fy * sa
     L = -Fx * sa + Fy * ca
 
     q = 0.5 * rho * Uinf * Uinf
-    Sref = 1.0
-    Cd = D / (q * Sref + 1e-30)
-    Cl = L / (q * Sref + 1e-30)
-    return Cl, Cd
+    Cd = D / (q + 1e-30)
+    Cl = L / (q + 1e-30)
+    return float(Cl), float(Cd)
+
 
 # ============================================================
-# Helpers p/ vorticidade e partículas (numba)
+# Forces: Control Volume (FIXED dt_eff)
+# prev_mom = (mx, my, step_index)
+# ============================================================
+
+@njit
+def cv_integrate_momentum(u, v, rho, x_min, y_min, dx, dy, nx, ny, x1, x2, y1, y2):
+    mx = 0.0
+    my = 0.0
+    vol = dx * dy
+
+    for j in range(1, ny + 1):
+        yc = y_min + (j - 0.5) * dy
+        if yc < y1 or yc > y2:
+            continue
+        for i in range(1, nx + 1):
+            xc = x_min + (i - 0.5) * dx
+            if xc < x1 or xc > x2:
+                continue
+
+            uc = 0.5 * (u[i, j] + u[i + 1, j])
+            vc = 0.5 * (v[i, j] + v[i, j + 1])
+
+            mx += rho * uc * vol
+            my += rho * vc * vol
+
+    return mx, my
+
+
+@njit
+def cv_surface_forces(u, v, p, rho, x_min, y_min, dx, dy, nx, ny, x1, x2, y1, y2):
+    Cx = 0.0
+    Cy = 0.0
+    Px = 0.0
+    Py = 0.0
+
+    nseg_y = max(8, int(np.round((y2 - y1) / dy)) * 2)  # mais amostras (ruído menor)
+    nseg_x = max(8, int(np.round((x2 - x1) / dx)) * 2)
+    ds_y = (y2 - y1) / nseg_y
+    ds_x = (x2 - x1) / nseg_x
+
+    # Left face x=x1, n=(-1,0)
+    x = x1
+    nxn = -1.0
+    nyn = 0.0
+    for k in range(nseg_y):
+        y = y1 + (k + 0.5) * ds_y
+        ux, vy = vel_at(u, v, x, y, x_min, y_min, dx, dy, nx, ny)
+        un = ux * nxn + vy * nyn
+        Cx += rho * ux * un * ds_y
+        Cy += rho * vy * un * ds_y
+
+        pp = sample_p(p, x, y, x_min, y_min, dx, dy, nx, ny)
+        Px += -(pp * nxn) * ds_y
+        Py += -(pp * nyn) * ds_y
+
+    # Right face x=x2, n=(+1,0)
+    x = x2
+    nxn = 1.0
+    nyn = 0.0
+    for k in range(nseg_y):
+        y = y1 + (k + 0.5) * ds_y
+        ux, vy = vel_at(u, v, x, y, x_min, y_min, dx, dy, nx, ny)
+        un = ux * nxn + vy * nyn
+        Cx += rho * ux * un * ds_y
+        Cy += rho * vy * un * ds_y
+
+        pp = sample_p(p, x, y, x_min, y_min, dx, dy, nx, ny)
+        Px += -(pp * nxn) * ds_y
+        Py += -(pp * nyn) * ds_y
+
+    # Bottom face y=y1, n=(0,-1)
+    y = y1
+    nxn = 0.0
+    nyn = -1.0
+    for k in range(nseg_x):
+        x = x1 + (k + 0.5) * ds_x
+        ux, vy = vel_at(u, v, x, y, x_min, y_min, dx, dy, nx, ny)
+        un = ux * nxn + vy * nyn
+        Cx += rho * ux * un * ds_x
+        Cy += rho * vy * un * ds_x
+
+        pp = sample_p(p, x, y, x_min, y_min, dx, dy, nx, ny)
+        Px += -(pp * nxn) * ds_x
+        Py += -(pp * nyn) * ds_x
+
+    # Top face y=y2, n=(0,+1)
+    y = y2
+    nxn = 0.0
+    nyn = 1.0
+    for k in range(nseg_x):
+        x = x1 + (k + 0.5) * ds_x
+        ux, vy = vel_at(u, v, x, y, x_min, y_min, dx, dy, nx, ny)
+        un = ux * nxn + vy * nyn
+        Cx += rho * ux * un * ds_x
+        Cy += rho * vy * un * ds_x
+
+        pp = sample_p(p, x, y, x_min, y_min, dx, dy, nx, ny)
+        Px += -(pp * nxn) * ds_x
+        Py += -(pp * nyn) * ds_x
+
+    return Cx, Cy, Px, Py
+
+
+def compute_force_coeffs_control_volume(u, v, p, rho, dt_base, step_idx,
+                                        x_min, y_min, dx, dy, nx, ny,
+                                        Uinf, alpha_rad,
+                                        cv_box, prev_mom=None):
+    x1, x2, y1, y2 = cv_box
+
+    mx, my = cv_integrate_momentum(u, v, rho, x_min, y_min, dx, dy, nx, ny, x1, x2, y1, y2)
+
+    if prev_mom is None:
+        dmxdt = 0.0
+        dmydt = 0.0
+        dt_eff = dt_base
+    else:
+        pmx, pmy, pstep = prev_mom
+        nstep = max(1, int(step_idx) - int(pstep))
+        dt_eff = float(dt_base) * float(nstep)
+        dmxdt = (mx - pmx) / max(dt_eff, 1e-30)
+        dmydt = (my - pmy) / max(dt_eff, 1e-30)
+
+    Cx, Cy, Px, Py = cv_surface_forces(u, v, p, rho, x_min, y_min, dx, dy, nx, ny, x1, x2, y1, y2)
+
+    # Force on body (approx, no viscous term on CV)
+    Fx = -dmxdt - Cx + Px
+    Fy = -dmydt - Cy + Py
+
+    ca = np.cos(alpha_rad)
+    sa = np.sin(alpha_rad)
+    D = Fx * ca + Fy * sa
+    L = -Fx * sa + Fy * ca
+
+    q = 0.5 * rho * Uinf * Uinf
+    Cd = D / (q + 1e-30)
+    Cl = L / (q + 1e-30)
+
+    new_prev = (float(mx), float(my), int(step_idx))
+    return float(Cl), float(Cd), (float(Fx), float(Fy)), new_prev
+
+
+# ============================================================
+# Outputs: cell-centered, vorticity, particles
 # ============================================================
 
 @njit(parallel=True)
@@ -374,6 +549,7 @@ def make_cell_centered(u, v, uc, vc, nx, ny):
         for i in range(1, nx + 1):
             uc[i - 1, j - 1] = 0.5 * (u[i, j] + u[i + 1, j])
             vc[i - 1, j - 1] = 0.5 * (v[i, j] + v[i, j + 1])
+
 
 @njit(parallel=True)
 def compute_vorticity(uc, vc, w, dx, dy, nx, ny):
@@ -385,10 +561,12 @@ def compute_vorticity(uc, vc, w, dx, dy, nx, ny):
             dudy = (uc[i, j + 1] - uc[i, j - 1]) * inv2dy
             w[i, j] = dvdx - dudy
 
+
 @njit(parallel=True)
 def advect_particles_rk2(xp, yp, u, v, dt, x_min, x_max, y_min, y_max, dx, dy, nx, ny):
     for k in prange(xp.shape[0]):
-        x = xp[k]; y = yp[k]
+        x = xp[k]
+        y = yp[k]
 
         u1, v1 = vel_at(u, v, x, y, x_min, y_min, dx, dy, nx, ny)
         xm = x + 0.5 * dt * u1
@@ -406,66 +584,9 @@ def advect_particles_rk2(xp, yp, u, v, dt, x_min, x_max, y_min, y_max, dx, dy, n
         xp[k] = xn
         yp[k] = yn
 
-# ============================================================
-# Public: cavity (mantido)
-# ============================================================
-
-def simulate_cavity(nx, ny, steps, dt, rho, nu, U_lid, out_every=200):
-    dx = 1.0 / nx
-    dy = 1.0 / ny
-
-    u = np.zeros((nx + 3, ny + 2), dtype=np.float32)
-    v = np.zeros((nx + 2, ny + 3), dtype=np.float32)
-    p = np.zeros((nx + 2, ny + 2), dtype=np.float32)
-
-    u_adv = np.zeros_like(u)
-    v_adv = np.zeros_like(v)
-    u_star = np.zeros_like(u)
-    v_star = np.zeros_like(v)
-
-    div = np.zeros_like(p)
-    b = np.zeros_like(p)
-
-    r = np.zeros_like(p)
-    z = np.zeros_like(p)
-    d = np.zeros_like(p)
-    Ap = np.zeros_like(p)
-
-    apply_bc_cavity(u, v, p, nx, ny, U_lid)
-
-    x_min, x_max = 0.0, 1.0
-    y_min, y_max = 0.0, 1.0
-
-    for n in range(1, steps + 1):
-        advect_semi_lagrangian(u, v, u_adv, v_adv, dt, x_min, x_max, y_min, y_max, dx, dy, nx, ny)
-        diffuse_inplace(u_adv, v_adv, u_star, v_star, nu, dt, dx, dy, nx, ny)
-        apply_bc_cavity(u_star, v_star, p, nx, ny, U_lid)
-
-        compute_divergence(u_star, v_star, div, dx, dy, nx, ny)
-        b[1:nx + 1, 1:ny + 1] = (rho / dt) * div[1:nx + 1, 1:ny + 1]
-        zero_mean_rhs_inplace(b, nx, ny)
-
-        iters = pcg_poisson_inplace(p, b, r, z, d, Ap, dx, dy, nx, ny, max_iter=300, tol=5e-7)
-        apply_bc_cavity(u_star, v_star, p, nx, ny, U_lid)
-
-        project(u_star, v_star, p, dt, rho, dx, dy, nx, ny)
-        apply_bc_cavity(u_star, v_star, p, nx, ny, U_lid)
-
-        u, u_star = u_star, u
-        v, v_star = v_star, v
-
-        if out_every and (n % out_every == 0):
-            dnorm = float(np.sqrt(np.mean(div[1:nx + 1, 1:ny + 1] ** 2)))
-            print(f"[cavity] step {n}/{steps} | pcg {iters} | div_rms {dnorm:.3e}")
-
-    uc = np.zeros((nx, ny), dtype=np.float32)
-    vc = np.zeros((nx, ny), dtype=np.float32)
-    make_cell_centered(u, v, uc, vc, nx, ny)
-
-    return {"p": p[1:nx + 1, 1:ny + 1].copy(), "uc": uc, "vc": vc}
 
 # ============================================================
-# Public: airfoil (com gravação de vorticidade + partículas)
+# Public API
 # ============================================================
 
 def simulate_airfoil_naca4412(
@@ -475,14 +596,27 @@ def simulate_airfoil_naca4412(
     x_min, x_max, y_min, y_max,
     chi_cell, eta=1e-3,
     out_every=200,
-    record_every=25,          # grava a cada N passos
-    record_max=240,           # limite de frames (RAM)
-    with_particles=True,
-    n_particles=4000,
+
+    init_state=None,
+
+    stop_enable=True,
+    stop_min_steps=600,
+    stop_check_every=100,
+    stop_window=4,
+    stop_tol_cl=2e-3,
+    stop_tol_div=5e-4,
+
+    force_method="cv",     # "brinkman" | "cv" | "both"
+    cv_box=(-0.25, 1.25, -0.50, 0.50),
+
+    record_every=0,
+    record_max=0,
+    with_particles=False,
+    n_particles=0,
     seed_x=-1.5,
     seed_ymin=-0.4,
     seed_ymax=0.4,
-    particles_seed=1234
+    particles_seed=1234,
 ):
     dx = (x_max - x_min) / nx
     dy = (y_max - y_min) / ny
@@ -501,7 +635,7 @@ def simulate_airfoil_naca4412(
 
     r = np.zeros_like(p)
     z = np.zeros_like(p)
-    d = np.zeros_like(p)
+    dvec = np.zeros_like(p)
     Ap = np.zeros_like(p)
 
     alpha = np.deg2rad(alpha_deg)
@@ -510,7 +644,6 @@ def simulate_airfoil_naca4412(
 
     chi_cell = np.asarray(chi_cell, dtype=np.float32)
 
-    # chi_u / chi_v FRACIONÁRIOS (média de células adjacentes)
     chi_u = np.zeros((nx + 1, ny), dtype=np.float32)
     for j in range(ny):
         for i in range(nx + 1):
@@ -525,45 +658,59 @@ def simulate_airfoil_naca4412(
             top = chi_cell[i, j] if j < ny else 0.0
             chi_v[i, j] = 0.5 * (bot + top)
 
-    # Inicializa freestream
-    u[1:nx + 2, 1:ny + 1] = Ux
-    v[1:nx + 1, 1:ny + 2] = Uy
+    # init
+    if isinstance(init_state, dict) and ("u" in init_state) and ("v" in init_state) and ("p" in init_state):
+        u[:, :] = np.asarray(init_state["u"], dtype=np.float32)
+        v[:, :] = np.asarray(init_state["v"], dtype=np.float32)
+        p[:, :] = np.asarray(init_state["p"], dtype=np.float32)
+    else:
+        u[1:nx + 2, 1:ny + 1] = Ux
+        v[1:nx + 1, 1:ny + 2] = Uy
+        p[:, :] = 0.0
+
     apply_bc_airfoil(u, v, p, nx, ny, Ux, Uy)
 
-    # buffers para gravação
-    uc_buf = np.zeros((nx, ny), dtype=np.float32)
-    vc_buf = np.zeros((nx, ny), dtype=np.float32)
-    w_buf  = np.zeros((nx, ny), dtype=np.float32)
-
+    # recording
     frames_w = []
     particles_frames = None
 
-    # partículas
-    if with_particles and n_particles > 0:
-        rng = np.random.default_rng(particles_seed)
-        xp = np.full((n_particles,), seed_x, dtype=np.float32)
-        yp = rng.uniform(seed_ymin, seed_ymax, size=(n_particles,)).astype(np.float32)
-        particles_frames = []
-    else:
-        xp = None
-        yp = None
+    uc_buf = vc_buf = w_buf = None
+    if record_every and record_max and record_max > 0:
+        uc_buf = np.zeros((nx, ny), dtype=np.float32)
+        vc_buf = np.zeros((nx, ny), dtype=np.float32)
+        w_buf = np.zeros((nx, ny), dtype=np.float32)
 
-    Cl = 0.0
-    Cd = 0.0
+    xp = yp = None
+    if with_particles and (n_particles is not None) and (n_particles > 0):
+        rng = np.random.default_rng(int(particles_seed))
+        xp = np.full((int(n_particles),), float(seed_x), dtype=np.float32)
+        yp = rng.uniform(float(seed_ymin), float(seed_ymax), size=(int(n_particles),)).astype(np.float32)
+        particles_frames = []
+
+    # early stop
+    cl_hist = []
+    div_hist = []
+    last_check_step = 0
+    stopped_early = False
+
+    # CV memory (FIXED)
+    prev_mom_cv = None
+
+    Cl = Cd = 0.0
+    Cl_b = Cd_b = 0.0
+    Cl_cv = Cd_cv = 0.0
 
     for n in range(1, steps + 1):
         advect_semi_lagrangian(u, v, u_adv, v_adv, dt, x_min, x_max, y_min, y_max, dx, dy, nx, ny)
         diffuse_inplace(u_adv, v_adv, u_star, v_star, nu, dt, dx, dy, nx, ny)
-
         brinkman_penalize(u_star, v_star, chi_u, chi_v, dt, eta, nx, ny)
-
         apply_bc_airfoil(u_star, v_star, p, nx, ny, Ux, Uy)
 
         compute_divergence(u_star, v_star, div, dx, dy, nx, ny)
         b[1:nx + 1, 1:ny + 1] = (rho / dt) * div[1:nx + 1, 1:ny + 1]
         zero_mean_rhs_inplace(b, nx, ny)
 
-        iters = pcg_poisson_inplace(p, b, r, z, d, Ap, dx, dy, nx, ny, max_iter=350, tol=5e-7)
+        iters = pcg_poisson_inplace(p, b, r, z, dvec, Ap, dx, dy, nx, ny, max_iter=350, tol=5e-7)
         apply_bc_airfoil(u_star, v_star, p, nx, ny, Ux, Uy)
 
         project(u_star, v_star, p, dt, rho, dx, dy, nx, ny)
@@ -572,46 +719,114 @@ def simulate_airfoil_naca4412(
         u, u_star = u_star, u
         v, v_star = v_star, v
 
-        # partículas (deslocamento do fluido)
         if xp is not None:
             advect_particles_rk2(xp, yp, u, v, dt, x_min, x_max, y_min, y_max, dx, dy, nx, ny)
 
-        # grava frames
-        if record_every and (n % record_every == 0) and (len(frames_w) < record_max):
+        if record_every and record_max and (n % int(record_every) == 0) and (len(frames_w) < int(record_max)):
             make_cell_centered(u, v, uc_buf, vc_buf, nx, ny)
             w_buf[:, :] = 0.0
             compute_vorticity(uc_buf, vc_buf, w_buf, dx, dy, nx, ny)
             frames_w.append(w_buf.astype(np.float16).copy())
 
-            if xp is not None:
-                P = np.empty((n_particles, 2), dtype=np.float32)
+            if particles_frames is not None:
+                P = np.empty((xp.shape[0], 2), dtype=np.float32)
                 P[:, 0] = xp
                 P[:, 1] = yp
                 particles_frames.append(P)
 
-        if out_every and (n % out_every == 0):
+        if out_every and (n % int(out_every) == 0):
             dnorm = float(np.sqrt(np.mean(div[1:nx + 1, 1:ny + 1] ** 2)))
-            Cl, Cd = compute_force_coeffs_brinkman(u, v, chi_u, chi_v, rho, eta, Uinf, alpha, dx, dy, nx, ny)
-            print(f"[airfoil] step {n}/{steps} | pcg {iters} | div_rms {dnorm:.3e} | Cl~{Cl:.3f} Cd~{Cd:.3f}")
 
-    # cell-centered final
+            Cl_b, Cd_b = compute_force_coeffs_brinkman(u, v, chi_u, chi_v, rho, eta, Uinf, alpha, dx, dy, nx, ny)
+            Cl_cv, Cd_cv, _, prev_mom_cv = compute_force_coeffs_control_volume(
+                u, v, p, rho, dt, n,
+                x_min, y_min, dx, dy, nx, ny,
+                Uinf, alpha, cv_box, prev_mom=prev_mom_cv
+            )
+
+            if force_method == "brinkman":
+                Cl, Cd = Cl_b, Cd_b
+                print(f"[airfoil] step {n}/{steps} | pcg {iters} | div_rms {dnorm:.3e} | Cl~{Cl:.3f} Cd~{Cd:.3f}")
+            elif force_method == "cv":
+                Cl, Cd = Cl_cv, Cd_cv
+                print(f"[airfoil] step {n}/{steps} | pcg {iters} | div_rms {dnorm:.3e} | Cl~{Cl:.3f} Cd~{Cd:.3f}")
+            else:
+                Cl, Cd = Cl_cv, Cd_cv
+                print(
+                    f"[airfoil] step {n}/{steps} | pcg {iters} | div_rms {dnorm:.3e} | "
+                    f"Brinkman Cl~{Cl_b:.3f} Cd~{Cd_b:.3f} | "
+                    f"CV Cl~{Cl_cv:.3f} Cd~{Cd_cv:.3f}"
+                )
+
+        if stop_enable and (n >= int(stop_min_steps)) and (stop_check_every > 0) and (n - last_check_step >= int(stop_check_every)):
+            last_check_step = n
+            dnorm = float(np.sqrt(np.mean(div[1:nx + 1, 1:ny + 1] ** 2)))
+
+            Cl_b, Cd_b = compute_force_coeffs_brinkman(u, v, chi_u, chi_v, rho, eta, Uinf, alpha, dx, dy, nx, ny)
+            Cl_cv, Cd_cv, _, prev_mom_cv = compute_force_coeffs_control_volume(
+                u, v, p, rho, dt, n,
+                x_min, y_min, dx, dy, nx, ny,
+                Uinf, alpha, cv_box, prev_mom=prev_mom_cv
+            )
+
+            Cl_now = Cl_b if force_method == "brinkman" else Cl_cv
+
+            cl_hist.append(float(Cl_now))
+            div_hist.append(float(dnorm))
+            if len(cl_hist) > int(stop_window):
+                cl_hist.pop(0)
+                div_hist.pop(0)
+
+            if len(cl_hist) == int(stop_window):
+                cl_range = max(cl_hist) - min(cl_hist)
+                div_range = max(div_hist) - min(div_hist)
+                if (cl_range < float(stop_tol_cl)) and (div_range < float(stop_tol_div)):
+                    stopped_early = True
+                    break
+
+    # final forces
+    Cl_b, Cd_b = compute_force_coeffs_brinkman(u, v, chi_u, chi_v, rho, eta, Uinf, alpha, dx, dy, nx, ny)
+    Cl_cv, Cd_cv, _, _ = compute_force_coeffs_control_volume(
+        u, v, p, rho, dt, n,
+        x_min, y_min, dx, dy, nx, ny,
+        Uinf, alpha, cv_box, prev_mom=None
+    )
+
+    if force_method == "brinkman":
+        Cl, Cd = Cl_b, Cd_b
+    else:
+        Cl, Cd = Cl_cv, Cd_cv
+
     uc = np.zeros((nx, ny), dtype=np.float32)
     vc = np.zeros((nx, ny), dtype=np.float32)
     make_cell_centered(u, v, uc, vc, nx, ny)
-
-    Cl, Cd = compute_force_coeffs_brinkman(u, v, chi_u, chi_v, rho, eta, Uinf, alpha, dx, dy, nx, ny)
 
     return {
         "p": p[1:nx + 1, 1:ny + 1].copy(),
         "uc": uc,
         "vc": vc,
-        "Cl": Cl,
-        "Cd": Cd,
-        "dx": dx,
-        "dy": dy,
+
+        "Cl": float(Cl),
+        "Cd": float(Cd),
+
+        "Cl_brinkman": float(Cl_b),
+        "Cd_brinkman": float(Cd_b),
+        "Cl_cv": float(Cl_cv),
+        "Cd_cv": float(Cd_cv),
+        "cv_box": tuple(cv_box),
+        "force_method": str(force_method),
+
+        "dx": float(dx),
+        "dy": float(dy),
+        "x_min": float(x_min), "x_max": float(x_max),
+        "y_min": float(y_min), "y_max": float(y_max),
+
+        "state": {"u": u.copy(), "v": v.copy(), "p": p.copy()},
+
+        "steps_ran": int(n),
+        "stopped_early": bool(stopped_early),
+
         "frames_w": frames_w,
         "particles": particles_frames,
-        "x_min": x_min, "x_max": x_max,
-        "y_min": y_min, "y_max": y_max,
-        "record_every": record_every,
+        "record_every": int(record_every) if record_every else 0,
     }
