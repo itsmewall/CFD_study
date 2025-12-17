@@ -1,4 +1,5 @@
 # run.py
+import os
 import time
 import numpy as np
 import matplotlib.pyplot as plt
@@ -8,18 +9,37 @@ from geometry import naca4_coordinates, build_chi_cell
 from mac_solver import simulate_airfoil_naca4412
 
 
-def _pick_dt(Uinf, dx, dy, cfl=0.6, dt_cap=0.0025):
-    # semi-Lagrangian é estável, mas dt grande piora forças; isso dá um “top” seguro
+STATE_PATH = "state_last.npz"
+
+
+def load_state(path=STATE_PATH):
+    if not os.path.exists(path):
+        return None
+    try:
+        data = np.load(path, allow_pickle=True)
+        return {"u": data["u"], "v": data["v"], "p": data["p"]}
+    except Exception:
+        return None
+
+
+def save_state(state, path=STATE_PATH):
+    try:
+        np.savez_compressed(path, u=state["u"], v=state["v"], p=state["p"])
+    except Exception:
+        pass
+
+
+def pick_dt(Uinf, dx, dy, cfl=0.6, dt_cap=0.0020):
     dt = cfl * min(dx, dy) / max(Uinf, 1e-9)
     return float(min(dt, dt_cap))
 
 
 def main():
     # =========================
-    # Config pro seu PC (boa qualidade x custo)
+    # Config (boa qualidade x custo)
     # =========================
     nx, ny = 320, 160
-    steps = 2800                 # dá mais assentamento
+    steps = 2800
     out_every = 250
 
     # Escoamento
@@ -34,11 +54,15 @@ def main():
     x_min, x_max = -2.0 * c, 4.0 * c
     y_min, y_max = -1.5 * c, 1.5 * c
 
-    # Aerofólio NACA 4412 (AoA entra no freestream do solver)
+    # Aerofólio NACA 4412
     X, Y = naca4_coordinates(0.04, 0.4, 0.12, n=900)
 
+    # >>> FIX CRÍTICO: flip no Y para corrigir o sinal de Cl(0) do 4412
+    FLIP_AIRFOIL_Y = True
+    if FLIP_AIRFOIL_Y:
+        Y = -Y
+
     # chi fracionário + suavização
-    # Obs: supersample alto custa só no pré-processamento (não encarece o solver)
     chi_cell, dx, dy = build_chi_cell(
         nx, ny, x_min, x_max, y_min, y_max, X, Y,
         supersample=5,
@@ -46,25 +70,30 @@ def main():
         eps_cells=2.0
     )
 
-    # Time-step: escolha automática decente (forças mais estáveis)
-    dt = _pick_dt(Uinf, dx, dy, cfl=0.6, dt_cap=0.0020)
-
-    # Brinkman: parede “dura” mas sem explodir numericamente
+    dt = pick_dt(Uinf, dx, dy, cfl=0.6, dt_cap=0.0020)
     eta = 1e-3
 
-    # CV box: mais longe do aerofólio reduz viés (CV sem termo viscoso)
-    cv_box = (-0.75 * c, 2.0 * c, -0.9 * c, 0.9 * c)
+    # CV box mais afastada (menos viés/ruído)
+    cv_box = (-1.0 * c, 2.5 * c, -1.2 * c, 1.2 * c)
 
-    # Time-viz (vorticidade + partículas)
+    # Visualização temporal
     record_every = 25
     record_max = 240
     with_particles = True
     n_particles = 3500
 
+    # Warm start
+    init_state = load_state()
+
+    # Pressão: use PCG como default (robusto). MG só se quiser testar.
+    pressure_solver = "pcg"  # "pcg" (recomendado) | "mg"
+    mg_fallback_rtol = 0.15  # se usar mg, cai pra pcg automaticamente se residual estiver ruim
+
     print("=== Config ===")
     print(f"grid={nx}x{ny}  dx={dx:.5f} dy={dy:.5f}  dt={dt:.5f}")
     print(f"Re={Re} alpha={alpha_deg}deg  steps={steps}")
-    print(f"cv_box={cv_box}")
+    print(f"cv_box={cv_box}  pressure_solver={pressure_solver}")
+    print(f"flip_airfoil_y={FLIP_AIRFOIL_Y}")
     print("================\n")
 
     # =========================
@@ -80,12 +109,14 @@ def main():
         eta=eta,
         out_every=out_every,
 
-        # Forças: padrão confiável (Brinkman). CV fica como sanity-check.
+        init_state=init_state,
+
         force_method="both",
         cv_box=cv_box,
 
-        # Aceleração real: multigrid no Poisson (seu mac_solver já suporta)
-        pressure_solver="mg",
+        pressure_solver=pressure_solver,
+        mg_fallback_rtol=mg_fallback_rtol,
+
         mg_vcycles=10,
         mg_pre=2,
         mg_post=2,
@@ -93,7 +124,9 @@ def main():
         mg_coarse_relax=60,
         mg_min_size=32,
 
-        # Early stop (para economizar tempo quando estabiliza)
+        pcg_max_iter=600,
+        pcg_tol=1e-6,
+
         stop_enable=True,
         stop_min_steps=900,
         stop_check_every=100,
@@ -101,7 +134,6 @@ def main():
         stop_tol_cl=2e-3,
         stop_tol_div=5e-4,
 
-        # gravação temporal
         record_every=record_every,
         record_max=record_max,
         with_particles=with_particles,
@@ -113,9 +145,17 @@ def main():
     )
     t1 = time.time()
 
-    print(f"\nTempo total: {t1 - t0:.2f}s | Cl~{res['Cl']:.3f} Cd~{res['Cd']:.3f}")
-    if "pressure_solver" in res:
-        print(f"Pressure solver: {res['pressure_solver']}")
+    print(f"\nTempo total: {t1 - t0:.2f}s | steps_ran={res['steps_ran']} stopped_early={res['stopped_early']}")
+    print(f"Cl~{res['Cl']:.3f} Cd~{res['Cd']:.3f} | solver={res.get('pressure_solver','?')}")
+    print(f"Brinkman: Cl~{res.get('Cl_brinkman', np.nan):.3f} Cd~{res.get('Cd_brinkman', np.nan):.3f}")
+    print(f"CV      : Cl~{res.get('Cl_cv', np.nan):.3f} Cd~{res.get('Cd_cv', np.nan):.3f}")
+
+    if not (np.isfinite(res["Cl"]) and np.isfinite(res["Cd"])):
+        print("\n[ERRO] Cl/Cd não finitos. (Se estiver em MG, use PCG.)")
+        return
+
+    # salva estado
+    save_state(res["state"])
 
     # =========================
     # Plot final (zoom)
@@ -174,19 +214,14 @@ def main():
                 return im, sc
             return (im,)
 
-        ani = animation.FuncAnimation(
-            fig, update, frames=len(frames), interval=40, blit=True
-        )
+        ani = animation.FuncAnimation(fig, update, frames=len(frames), interval=40, blit=True)
         plt.tight_layout()
         plt.show()
 
-        # Salvar (opcional; requer ffmpeg para mp4)
-        # ani.save("vorticidade_tracers.mp4", fps=25, dpi=140)
-
     # =========================
-    # Salvar resultado bruto
+    # Salvar resultado
     # =========================
-    np.savez(
+    np.savez_compressed(
         "naca4412_timeviz.npz",
         p=res["p"], uc=uc, vc=vc,
         Cl=res["Cl"], Cd=res["Cd"],
@@ -199,6 +234,7 @@ def main():
         dx=res["dx"], dy=res["dy"],
         record_every=res.get("record_every", 0),
         pressure_solver=res.get("pressure_solver", "unknown"),
+        flip_airfoil_y=FLIP_AIRFOIL_Y,
     )
 
 
